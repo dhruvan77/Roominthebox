@@ -1,11 +1,11 @@
 # Room in the Box — Backend (FastAPI + Supabase)
 
-FastAPI backend where a **Master AI**, a **Manager AI** and up to **five configurable role AIs**
+FastAPI backend where a **Master AI**, a **Manager AI**, up to **eight configurable role AIs** (presets and any number of custom ones) and a **Concluder**
 hold a live, Manager-orchestrated group discussion and converge on a final answer.
 API keys live only in the server environment and are never sent to the browser.
 
 ```
-USER → MASTER → MANAGER → [roles] → MANAGER → [roles] → … → MANAGER: ["conclude"] → FINAL ANSWER
+USER → MASTER (opening) → [ MANAGER picks ONE role → that role replies ]×N → WRAP-UP turn → CONCLUDER → MASTER (final answer)
 ```
 
 ## Run
@@ -27,7 +27,8 @@ All agents run **Groq `openai/gpt-oss-120b`**, each on its own key (6 total, ser
 |---|---|
 | `GROQ_API_KEY_MASTER` | Master AI |
 | `GROQ_API_KEY_MANAGER` | Manager AI |
-| `GROQ_API_KEY_ROLE1` … `GROQ_API_KEY_ROLE5` | 1st … 5th role the user selects (selection order) |
+| `GROQ_API_KEY_CONCLUDER` | Concluder (optional; reuses the Master key if empty) |
+| `GROQ_API_KEY_ROLE1` … `GROQ_API_KEY_ROLE10` | roles in selection order; with more roles than keys they share keys round-robin |
 | `GROQ_API_KEY` | optional fallback for any empty slot |
 
 Every call carries the agent's role prompt plus the shared history from `conversation.txt`.
@@ -39,7 +40,7 @@ turns fast. A discussion makes roughly 25–40 model calls; the client retries 4
 | Method & path | Purpose |
 |---|---|
 | `GET /api/roles` | Preset roles + limits (min/max roles, min/max steps) |
-| `POST /api/discussions` | Start. Body: `{"task": "...", "roles": ["student", "judge", {"name": "Lawyer", "perspective": "..."}]}` (2–5 roles: preset ids or custom). Returns `{id}` |
+| `POST /api/discussions` | Start. Body: `{"task": "...", "roles": ["student", {"name": "Lawyer", "perspective": "..."}, {"name": "CFO", "perspective": "..."}], "turn_mode": "auto"\|"manual", "turns": 5}` (2–`MAX_ROLES` roles, any mix of presets and custom; `turns` only for manual, clamped to 2–`MAX_QUERIES`). Returns `{id, roles, turn_mode, turns}` |
 | `GET /api/discussions/{id}/stream` | **SSE** live group chat (supports `Last-Event-ID` reconnect/replay) |
 | `GET /api/discussions/{id}` | Status, final answer and all events |
 | `GET /api/discussions/{id}/conversation` | The shared `conversation.txt` |
@@ -51,7 +52,7 @@ If `ACCESS_TOKEN` is set, send it as `X-Access-Token` header or `?token=` (neede
 
 `session` · `status` · `typing` · `message` · `final` · `error` · `done`
 
-`message` data: `{speaker, kind: "master"|"manager"|"role"|"system", text, role_id?, query?, targets?, step?}`.
+`message` data: `{speaker, kind: "master"|"manager"|"role"|"concluder"|"system", text, role_id?, query?, targets?, step?, phase?}` where `phase` is `explore|narrow|converge|wrapup|concluder`.
 `done` data: `{status: "completed"|"error"|"cancelled"}`.
 
 ```js
@@ -63,21 +64,27 @@ es.addEventListener("done",    () => es.close());
 
 ## How it works
 
-- **Manager output** is JSON: `["<message>", ["student","judge"]]` or `["conclude"]`. Parsing tolerates
-  code fences/prose, accepts role ids or names, and retries twice with a correction; if it stays
-  unusable the backend falls back to routing to the least-heard role so the loop never stalls.
-- **Routing is dynamic**: the Manager sees the full transcript and picks who speaks based on what was
-  actually said — no fixed rotation. Roles addressed in the same step answer sequentially, so the
-  second can react to the first.
-- **Shared memory**: every message is appended to `data/sessions/<id>/conversation.txt`
-  (plus `events.jsonl`, `meta.json`, `final.txt`). Each agent gets that history on every call
-  (oldest middle trimmed past `MAX_HISTORY_CHARS`, keeping the task, the Master's opening and recent turns).
-- **Length**: the backend rejects `conclude` before `MIN_QUERIES` (default 10) routing steps and tells the
-  Manager to keep going; `MAX_QUERIES` (default 24) is a hard cap.
-- **Conclusion**: on `["conclude"]` the loop stops, the transcript is preserved, and the Master writes the
-  final answer from the whole discussion.
-- **Safeguards**: task length cap, concurrent-session cap, retries with backoff, abort after 3
-  consecutive agent failures, key names (never values) in errors, CORS allow-list, optional access token.
+- **One turn = one AI message.** The Master's opening is not counted. Each turn the Manager picks exactly one
+  role and a short instruction, based on what was actually said; that role replies. Replies can be one line or
+  a short paragraph (the prompts allow both, up to ~130 words).
+- **Length is exact in MANUAL mode.** With `turns = N`: turns 1…N-2 are open discussion, turn **N-1 is the wrap-up**
+  (any role, chosen by the Manager, states the decision it believes was reached) and turn **N is the Concluder**.
+  Example: 5 → turns 1-3 discuss, turn 4 starts the conclusion, turn 5 is the Concluder.
+- **AUTO mode.** After `MIN_QUERIES` turns the Manager may output `["conclude"]` (optionally `["conclude","role_id"]`).
+  That turn becomes the wrap-up and the Concluder follows. Earlier attempts are rejected; `MAX_QUERIES` is a hard
+  cap (wrap-up at cap-1, Concluder at cap).
+- **Everyone paces themselves.** Every prompt says which turn it is, how many remain and the current phase:
+  `explore` (distinct views) → `narrow` (resolve disagreements) → `converge` (commit/concede) → `wrapup`.
+- **The Concluder** appears only at the end, reads the whole transcript and writes the decision
+  (Decision / Why it won / Trade-offs & dissent / Next steps) as a chat message of `kind: "concluder"`.
+  The Master then turns that decision into the final answer (`final` event); the Concluder's ruling is binding.
+- **Manager output** is JSON and tolerant (code fences, ids or names); it retries with a correction and falls back to
+  the role that has been quiet longest, so the loop never stalls.
+- **Shared memory**: every message goes into the shared transcript and each agent receives it on every call
+  (oldest middle trimmed past `MAX_HISTORY_CHARS`). Sessions and events are saved to Supabase; the turn settings are
+  stored in the first `session` event, so **no schema change is needed**.
+- **Safeguards**: task length cap, concurrent-session cap, retries with backoff, abort after 3 consecutive agent
+  failures, key names (never values) in errors, CORS allow-list, optional access token.
 
 Note: a discussion keeps running if the browser tab closes (so it can be resumed via the stream
 endpoint); call `/stop` to cancel and save API spend.
@@ -85,6 +92,6 @@ endpoint); call `/stop` to cancel and save API spend.
 ## Layout
 
 ```
-app/  config.py roles.py memory.py llm.py (Groq client) mock.py routing.py agents.py sessions.py orchestrator.py main.py
+app/  config.py roles.py memory.py llm.py (Groq client) mock.py routing.py plan.py agents.py sessions.py orchestrator.py main.py
 tests/smoke_test.py
 ```
