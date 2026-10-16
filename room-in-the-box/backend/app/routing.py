@@ -38,15 +38,25 @@ def _extract_json(raw: str):
 
 
 def parse_decision(raw: str, roles: list[Role]) -> Decision:
-    """Accepts ["conclude"] or ["<query>", ["role_id", ...]] (role ids or names, case-insensitive)."""
+    """Accepts ["conclude"], ["conclude", "<role_id>"] or ["<query>", ["role_id", ...]]
+    (role ids or names, case-insensitive)."""
     value = _extract_json(raw)
     if not isinstance(value, list) or not value:
         raise RoutingError("output must be a non-empty JSON array")
 
-    if len(value) == 1 and isinstance(value[0], str) and value[0].strip().lower() == "conclude":
-        return Decision(conclude=True)
+    lookup = {}
+    for r in roles:
+        lookup[_norm(r.id)] = r.id
+        lookup[_norm(r.name)] = r.id
+
+    if isinstance(value[0], str) and value[0].strip().lower() == "conclude" and len(value) <= 2:
+        opener = value[1] if len(value) == 2 else None
+        if isinstance(opener, list) and opener:
+            opener = opener[0]
+        rid = lookup.get(_norm(opener)) if isinstance(opener, str) else None
+        return Decision(conclude=True, roles=[rid] if rid else [])
     if len(value) != 2:
-        raise RoutingError('expected ["conclude"] or ["<message>", ["role_id", ...]]')
+        raise RoutingError('expected ["conclude"] or ["<message>", ["role_id"]]')
 
     query, targets = value
     if not isinstance(query, str) or not query.strip():
@@ -56,10 +66,6 @@ def parse_decision(raw: str, roles: list[Role]) -> Decision:
     if not isinstance(targets, list):
         raise RoutingError("second element must be a list of role ids")
 
-    lookup = {}
-    for r in roles:
-        lookup[_norm(r.id)] = r.id
-        lookup[_norm(r.name)] = r.id
     resolved: list[str] = []
     for t in targets:
         rid = lookup.get(_norm(t)) if isinstance(t, str) else None
@@ -77,7 +83,19 @@ _FALLBACK_QUERIES = [
 ]
 
 
-def fallback_decision(roles: list[Role], speak_counts: dict[str, int], step: int) -> Decision:
-    """Used only if the Manager keeps producing unusable output: pick the least-heard role."""
-    least = min(roles, key=lambda r: speak_counts.get(r.id, 0))
-    return Decision(False, _FALLBACK_QUERIES[step % len(_FALLBACK_QUERIES)], [least.id])
+WRAPUP_QUERY = ("Start the conclusion: state the decision you think the group has reached, the two or three "
+                "reasons it won, and the one risk that still matters.")
+
+
+def pick_speaker(roles: list[Role], last_spoke: dict[str, int], last_speaker: str | None = None) -> str:
+    """The role that has been quiet the longest (never the one who just spoke, if there is a choice)."""
+    pool = [r for r in roles if r.id != last_speaker] or roles
+    return min(pool, key=lambda r: last_spoke.get(r.id, 0)).id
+
+
+def fallback_decision(roles: list[Role], last_spoke: dict[str, int], step: int,
+                      last_speaker: str | None = None, wrapup: bool = False) -> Decision:
+    """Used only if the Manager keeps producing unusable output: pick the role quiet the longest."""
+    rid = pick_speaker(roles, last_spoke, last_speaker)
+    query = WRAPUP_QUERY if wrapup else _FALLBACK_QUERIES[step % len(_FALLBACK_QUERIES)]
+    return Decision(False, query, [rid])

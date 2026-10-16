@@ -41,6 +41,8 @@ class Session:
     transcript: Transcript | None = None
     handle: asyncio.Task | None = None
     conversation: str | None = None
+    turn_mode: str = "auto"      # auto | manual
+    turns: int | None = None     # manual only: total turns including the Concluder
     _cond: asyncio.Condition = field(default_factory=asyncio.Condition)
     _writes: set = field(default_factory=set)
 
@@ -98,7 +100,8 @@ class Session:
 
     def summary(self) -> dict:
         return {"id": self.id, "task": self.task, "roles": [r.to_dict() for r in self.roles],
-                "status": self.status, "final": self.final}
+                "status": self.status, "final": self.final,
+                "turn_mode": self.turn_mode, "turns": self.turns}
 
 
 class SessionStore:
@@ -108,9 +111,10 @@ class SessionStore:
     def active_count(self) -> int:
         return sum(1 for s in self.sessions.values() if not s.finished)
 
-    async def create(self, task: str, roles: list[Role]) -> Session:
+    async def create(self, task: str, roles: list[Role], turn_mode: str = "auto",
+                     turns: int | None = None) -> Session:
         sid = uuid.uuid4().hex
-        s = Session(id=sid, task=task, roles=roles, transcript=Transcript())
+        s = Session(id=sid, task=task, roles=roles, transcript=Transcript(), turn_mode=turn_mode, turns=turns)
         self.sessions[sid] = s
         await db.insert_session({"id": sid, "task": task, "roles": [r.to_dict() for r in roles],
                                  "status": "running"})
@@ -132,6 +136,12 @@ class SessionStore:
                     status=row.get("status") or "interrupted", final=row.get("final"),
                     conversation=row.get("conversation"))
         s.events = await db.fetch_events(sid)
+        # turn settings are not columns: they live in the first ("session") event
+        first = next((e for e in s.events if e.get("type") == "session"), None)
+        if first:
+            d = first.get("data") or {}
+            s.turn_mode = d.get("turn_mode") or "auto"
+            s.turns = d.get("turns")
         if s.status == "running":  # it was running when the server stopped; nothing is running it now
             s.status = "interrupted"
         self.sessions[sid] = s

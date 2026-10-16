@@ -6,7 +6,7 @@ import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
-from typing import Union
+from typing import Literal, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from . import db, llm
 from .config import (ACCESS_TOKEN, CORS_ORIGINS, MAX_CONCURRENT_SESSIONS, MAX_ROLES, MAX_TASK_CHARS,
-                     MIN_QUERIES, MAX_QUERIES, missing_slots)
+                     MIN_MANUAL_TURNS, MIN_QUERIES, MAX_QUERIES, missing_slots)
 from .orchestrator import run_discussion
 from .roles import PRESETS, resolve_roles
 from .sessions import store
@@ -59,6 +59,8 @@ class RoleIn(BaseModel):
 class StartIn(BaseModel):
     task: str = Field(min_length=3)
     roles: list[Union[str, RoleIn]]
+    turn_mode: Literal["auto", "manual"] = "auto"   # auto: the Manager decides when to wrap up
+    turns: int | None = Field(default=None, ge=1, le=1000)  # manual: total turns, the last one is the Concluder
 
 
 @app.get("/api/health")
@@ -69,7 +71,8 @@ async def health():
 @app.get("/api/roles", dependencies=[Depends(auth)])
 async def roles():
     return {"presets": [r.to_dict() for r in PRESETS.values()], "min_roles": 2, "max_roles": MAX_ROLES,
-            "min_queries": MIN_QUERIES, "max_queries": MAX_QUERIES}
+            "min_queries": MIN_QUERIES, "max_queries": MAX_QUERIES,
+            "turn_modes": ["auto", "manual"], "min_turns": MIN_MANUAL_TURNS, "max_turns": MAX_QUERIES}
 
 
 @app.post("/api/discussions", status_code=201, dependencies=[Depends(auth)])
@@ -82,15 +85,21 @@ async def start(body: StartIn):
     except ValueError as e:
         raise HTTPException(422, str(e))
 
+    turns = None
+    if body.turn_mode == "manual":
+        if body.turns is None:
+            raise HTTPException(422, "Enter the number of conversations for manual mode.")
+        turns = max(MIN_MANUAL_TURNS, min(MAX_QUERIES, body.turns))  # clamp into the allowed range
+
     missing = missing_slots(len(roles_))  # names only, never values
     if missing:
         raise HTTPException(500, "Server is missing API keys for: " + ", ".join(f"GROQ_API_KEY_{m}" for m in missing))
     if store.active_count() >= MAX_CONCURRENT_SESSIONS:
         raise HTTPException(429, "Too many discussions running; try again shortly.")
 
-    session = await store.create(task, roles_)
+    session = await store.create(task, roles_, body.turn_mode, turns)
     session.handle = asyncio.create_task(run_discussion(session))
-    return {"id": session.id, "roles": [r.to_dict() for r in roles_]}
+    return {"id": session.id, "roles": [r.to_dict() for r in roles_], "turn_mode": body.turn_mode, "turns": turns}
 
 
 @app.get("/api/discussions/{sid}/stream", dependencies=[Depends(auth)])

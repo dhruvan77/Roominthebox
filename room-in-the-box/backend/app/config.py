@@ -30,9 +30,14 @@ def _temperature() -> float | None:
         return 0.8
 
 
-MIN_QUERIES = _int("MIN_QUERIES", 10)
-MAX_QUERIES = max(_int("MAX_QUERIES", 24), MIN_QUERIES)
-MAX_ROLES = min(_int("MAX_ROLES", 5), 5)
+# One "turn" = one AI message in the discussion (the Master opening is not counted).
+# AUTO mode : the Manager may call the wrap-up once MIN_QUERIES turns have happened; MAX_QUERIES is the hard
+#             cap on total turns including the wrap-up and the Concluder.
+# MANUAL    : the user picks N turns (2..MAX_QUERIES): turn N-1 is the wrap-up, turn N is the Concluder.
+MIN_MANUAL_TURNS = 2
+MIN_QUERIES = max(_int("MIN_QUERIES", 6), 1)
+MAX_QUERIES = max(_int("MAX_QUERIES", 16), MIN_QUERIES + 3, MIN_MANUAL_TURNS)
+MAX_ROLES = max(2, min(_int("MAX_ROLES", 8), 10))
 MAX_HISTORY_CHARS = _int("MAX_HISTORY_CHARS", 24000)
 MAX_TASK_CHARS = _int("MAX_TASK_CHARS", 4000)
 MAX_CONCURRENT_SESSIONS = _int("MAX_CONCURRENT_SESSIONS", 5)
@@ -53,17 +58,29 @@ GROQ_BASE_URL = _env("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("
 REASONING_EFFORT = _env("REASONING_EFFORT", "low")            # low | medium | high (gpt-oss)
 LLM_CONCURRENCY = max(_int("LLM_CONCURRENCY", 2), 1)          # simultaneous calls per key
 
-ROLE_SLOTS = [f"ROLE{i}" for i in range(1, 6)]
-ALL_SLOTS = ["MASTER", "MANAGER", *ROLE_SLOTS]
+ROLE_SLOTS = [f"ROLE{i}" for i in range(1, 11)]
+ALL_SLOTS = ["MASTER", "MANAGER", "CONCLUDER", *ROLE_SLOTS]
 
 
 def get_key(slot: str) -> str:
-    """GROQ_API_KEY_<SLOT>; falls back to the optional shared GROQ_API_KEY if that slot is empty."""
-    return _env(f"GROQ_API_KEY_{slot}") or _env("GROQ_API_KEY")
+    """GROQ_API_KEY_<SLOT>; falls back to the optional shared GROQ_API_KEY if that slot is empty.
+    The Concluder has its own optional key and otherwise reuses the Master's key."""
+    key = _env(f"GROQ_API_KEY_{slot}")
+    if not key and slot == "CONCLUDER":
+        key = _env("GROQ_API_KEY_MASTER")
+    return key or _env("GROQ_API_KEY")
+
+
+def role_slot(index: int) -> str:
+    """Key slot for the index-th role. With more roles than keys, roles share keys round-robin."""
+    configured = [s for s in ROLE_SLOTS if _env(f"GROQ_API_KEY_{s}")]
+    pool = configured or ROLE_SLOTS
+    return pool[index % len(pool)]
 
 
 def missing_slots(n_roles: int = 5) -> list[str]:
-    """Slot names (never key values) that have no key, for Master + Manager + the first n role slots."""
+    """Slot names (never key values) that have no key, for Master + Manager + the slots the roles will use."""
     if USE_MOCK:
         return []
-    return [s for s in ["MASTER", "MANAGER", *ROLE_SLOTS[:n_roles]] if not get_key(s)]
+    need = ["MASTER", "MANAGER", *[role_slot(i) for i in range(n_roles)]]
+    return [s for s in dict.fromkeys(need) if not get_key(s)]
