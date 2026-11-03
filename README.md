@@ -1,3 +1,4 @@
+#roominthebox
 Multi-Agent AI Group Discussion System
 
 An AI-powered multi-agent orchestration platform where multiple specialized AI agents collaborate, debate, challenge ideas, and refine solutions through dynamic group discussions.
